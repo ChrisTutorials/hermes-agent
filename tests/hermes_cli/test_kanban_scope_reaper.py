@@ -120,22 +120,26 @@ def test_live_run_is_never_reaped_even_when_card_is_invisible(
         # created on a SECOND connection inside an open write transaction, so
         # `conn` -- the one the reaper reads -- sees nothing. A stubbed helper
         # would not prove this; the invisibility has to be genuine.
-        writer = kbc.connect()
-        writer.execute("BEGIN IMMEDIATE")
-        hidden = kb.create_task(writer, title="in flight", assignee="implementer")
-        writer.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, hidden))
-        hidden_unit = f"hermes-worker-kanban-{hidden}-run-{run_id}.scope"
-        units["set"](hidden_unit)
-        assert conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE id = ?", (hidden,)
-        ).fetchone()[0] == 0, "precondition: reader must not see the row"
+        # connect_closing, not `with connect()`: sqlite3's context manager
+        # commits but does NOT close the fd. A bare handle here held a write
+        # lock open and hung the rest of the suite.
+        with kbc.connect_closing() as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            hidden = kb.create_task(writer, title="in flight", assignee="implementer")
+            writer.execute(
+                "UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, hidden)
+            )
+            hidden_unit = f"hermes-worker-kanban-{hidden}-run-{run_id}.scope"
+            units["set"](hidden_unit)
+            assert conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE id = ?", (hidden,)
+            ).fetchone()[0] == 0, "precondition: reader must not see the row"
 
-        # The fresh probe reads committed state only, so it sees nothing either.
-        stopped: list[str] = []
-        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == []
-        assert stopped == [], "a live run must never be reaped"
-        writer.rollback()
-        writer.close()
+            # The fresh probe reads committed state only, so it sees nothing.
+            stopped: list[str] = []
+            assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == []
+            assert stopped == [], "a live run must never be reaped"
+            writer.rollback()
 
 
 def test_invisible_card_is_reaped_once_its_run_is_dead(
@@ -147,37 +151,38 @@ def test_invisible_card_is_reaped_once_its_run_is_dead(
         unit = f"hermes-worker-kanban-{tid}-run-999999.scope"
         units["set"](unit)
 
-        monkeypatch.setattr(kbd, "_card_exists_freshly", lambda _tid: False)
-        monkeypatch.setattr(kbd, "_scope_run_is_live", lambda _rid: False)
+        monkeypatch.setattr(kbd, "_card_exists_freshly", lambda _c, _tid: False)
+        monkeypatch.setattr(kbd, "_scope_run_is_live", lambda _c, _rid: False)
 
         stopped: list[str] = []
         assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == [unit]
         assert stopped == [unit]
 
 
-def test_probe_failure_spares_the_scope(kanban_home: Path, units, monkeypatch) -> None:
+def test_probe_failure_spares_the_scope(kanban_home: Path, units) -> None:
     """If we cannot prove it is dead, do not kill it.
 
-    Exercises the real failure path: the probe connection raises, and the
-    helpers' own ``except`` turns that into "assume alive".
+    A closed/unusable board must stop the reaper, not empty the machine. This
+    is the fail-closed contract: both helpers catch and answer "assume alive".
     """
-    import hermes_cli.kanban_db_connect as conn_mod
-
-    # Grab a real handle first; the patch below breaks every later connect().
+    # No `with`: its __exit__ commits, which would itself raise on the closed
+    # handle and mask what this test is checking.
     conn = kbc.connect()
     try:
-        def boom(*a, **kw):
-            raise RuntimeError("db gone")
-
-        monkeypatch.setattr(conn_mod, "connect", boom)
-
         unit = "hermes-worker-kanban-t_ffff0000-run-777777.scope"
         units["set"](unit)
+
+        # Kill the handle so every query raises -- what a dead board looks like.
+        conn.close()
+
+        assert kbd._scope_run_is_live(conn, 777777) is True
+        assert kbd._card_exists_freshly(conn, "t_ffff0000") is True
+
         stopped: list[str] = []
         assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == []
         assert stopped == []
     finally:
-        conn.close()
+        pass  # already closed
 
 
 def test_terminal_card_scope_is_reaped(kanban_home: Path, units) -> None:

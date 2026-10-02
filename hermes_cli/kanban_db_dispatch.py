@@ -540,34 +540,36 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
     return reaped
 
 
-def _scope_run_is_live(run_id: int) -> bool:
+def _scope_run_is_live(conn: sqlite3.Connection, run_id: int) -> bool:
     """True while the run a scope was created for is still open.
 
     The scope is named after the run that launched it, so a live run means a
     live worker no matter what the parent card row looks like right now.
-    """
-    from hermes_cli import kanban_db_connect as _conn_mod
 
+    Uses the caller's connection on purpose. Opening a second connection here
+    deadlocks: the reaper runs inside the dispatcher's write transaction, and a
+    nested read on the same WAL blocks forever behind the lock its own caller
+    holds. That hang is what stalled ``pytest -k kanban`` at 68%.
+    """
     try:
-        with _conn_mod.connect() as probe:
-            row = probe.execute(
-                "SELECT status FROM task_runs WHERE id = ?", (run_id,),
-            ).fetchone()
+        row = conn.execute(
+            "SELECT status FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone()
     except Exception:
         # Cannot prove it is dead, so do not kill it.
         return True
     return row is not None and row["status"] == "running"
 
 
-def _card_exists_freshly(task_id: str) -> bool:
-    """Re-read the card on a fresh connection, past any open write snapshot."""
-    from hermes_cli import kanban_db_connect as _conn_mod
+def _card_exists_freshly(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Re-read the card, past any write snapshot the caller holds.
 
+    Same connection, same reason as :func:`_scope_run_is_live`.
+    """
     try:
-        with _conn_mod.connect() as probe:
-            return probe.execute(
-                "SELECT 1 FROM tasks WHERE id = ?", (task_id,),
-            ).fetchone() is not None
+        return conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone() is not None
     except Exception:
         return True  # cannot disprove; never reap on a failed check
 
@@ -620,9 +622,15 @@ def reap_orphan_worker_scopes(conn: sqlite3.Connection, *, stop_fn=None) -> list
             continue  # not ours, or a name we do not recognise: never touch it
         task_id, run_id = match.group(1), int(match.group(2))
 
-        row = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
+        try:
+            row = conn.execute(
+                "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+        except Exception:
+            # A board we cannot read tells us nothing about this scope. Skipping
+            # the whole reaper is the fail-closed choice: an unreadable board
+            # must not let the reaper stop workers.
+            continue
         if row is None:
             # A missing row is NOT evidence of a dead card. The dispatcher
             # spawns inside an open write transaction: the scope name is built
@@ -633,12 +641,15 @@ def reap_orphan_worker_scopes(conn: sqlite3.Connection, *, stop_fn=None) -> list
             # (run 1341/1342/1343, "card missing" in errors.log).
             #
             # Two independent guards, either of which is sufficient:
-            #   1. re-check on a fresh connection, in case this connection is
-            #      inside an uncommitted snapshot;
-            #   2. never reap while the run itself is still live.
-            if _scope_run_is_live(run_id):
+            #   1. never reap while the run itself is still live;
+            #   2. re-read the card, in case this connection is inside an
+            #      uncommitted snapshot.
+            #
+            # Both read on the caller's connection. A second connection here
+            # deadlocks against the dispatcher's own open write transaction.
+            if _scope_run_is_live(conn, run_id):
                 continue
-            if _card_exists_freshly(task_id):
+            if _card_exists_freshly(conn, task_id):
                 continue
             reason = "card missing"
         else:
