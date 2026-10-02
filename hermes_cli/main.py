@@ -1968,6 +1968,7 @@ cmd_status = _forward_command("cmd_status", "hermes_cli.status", "show_status", 
 cmd_cron = _forward_command("cmd_cron", "hermes_cli.cron", "cron_command", forward_return=True, doc='Cron job management.')
 cmd_webhook = _forward_command("cmd_webhook", "hermes_cli.webhook", "webhook_command", doc='Webhook subscription management.')
 cmd_kanban = _forward_command("cmd_kanban", "hermes_cli.kanban", "kanban_command", forward_return=True, doc='Multi-profile collaboration board.')
+cmd_admit = _forward_command("cmd_admit", "hermes_cli.admit", "admit_command", forward_return=True, doc='Heavyweight admission runner.')
 cmd_project = _forward_command("cmd_project", "hermes_cli.projects_cmd", "projects_command", forward_return=True, doc='Manage projects (named, multi-folder workspaces).')
 cmd_hooks = _forward_command("cmd_hooks", "hermes_cli.hooks", "hooks_command", doc='Shell-hook inspection and management.')
 cmd_doctor = _forward_command("cmd_doctor", "hermes_cli.doctor", "run_doctor", forward_return=True, doc='Check configuration and dependencies.')
@@ -2887,7 +2888,7 @@ def cmd_console(args):
 # entry would let a plugin command silently fail to parse.
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
-        "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "codex-runtime", "completion",
+        "acp", "admit", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "codex-runtime", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
@@ -3497,6 +3498,12 @@ def _build_cli_parser():
 
     from hermes_cli.kanban import build_parser as _build_kanban_parser
     _build_kanban_parser(subparsers).set_defaults(func=cmd_kanban)
+
+    admit_p = subparsers.add_parser("admit", help="Gate heavyweight processes via host-wide admission")
+    admit_p.add_argument("--timeout", type=float, default=60.0, help="Max wait seconds (default 60s)")
+    admit_p.add_argument("--lock-path", type=Path, default=None, help="Lock file override")
+    admit_p.add_argument("cmd", nargs=argparse.REMAINDER, help="Command to run")
+    admit_p.set_defaults(func=cmd_admit)
 
     from hermes_cli.projects_cmd import build_parser as _build_project_parser
     _build_project_parser(subparsers).set_defaults(func=cmd_project)
