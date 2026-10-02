@@ -7,7 +7,7 @@ across agents using a cooperative file lock and live system pressure sampling.
 from __future__ import annotations
 
 import argparse
-import fcntl
+import getpass
 import logging
 import os
 import signal
@@ -16,6 +16,11 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Mapping
+
+try:
+    import fcntl  # windows-footgun: ok
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
 
 # Default timeout to acquire the admission lock before failing closed with 75 (resource blocked)
 DEFAULT_ADMISSION_WAIT_SECONDS = 60.0
@@ -54,7 +59,7 @@ def sample_system_pressure() -> dict[str, Any]:
         psi_file = f"/proc/pressure/{p_name}"
         if os.path.exists(psi_file):
             try:
-                with open(psi_file, encoding="utf-8") as f:
+                with open(psi_file, encoding="utf-8-sig") as f:
                     for line in f:
                         if line.startswith("some ") or line.startswith("full "):
                             prefix = f"{p_name}_{line.split()[0]}"
@@ -107,7 +112,8 @@ def run_admitted_command(
 
     if lock_path is None:
         runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
-        lock_path = Path(runtime_dir) / f"hermes-heavy-admission-{os.getuid()}.lock"
+        user_id = str(os.getuid()) if hasattr(os, "getuid") else getpass.getuser()
+        lock_path = Path(runtime_dir) / f"hermes-heavy-admission-{user_id}.lock"
 
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     start_time = time.monotonic()

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-import fcntl
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+try:
+    import fcntl  # windows-footgun: ok
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
 
 import pytest
 
