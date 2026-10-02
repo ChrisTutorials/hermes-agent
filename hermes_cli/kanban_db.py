@@ -3500,6 +3500,49 @@ def _nonblank_str(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and value.strip() else None
 
 
+# ponytail: default 3, hardcoded until a card proves it needs more. A review
+# loop that has failed 3x is not converging on its own — escalate to a human
+# instead of holding a dispatch slot. Raise if real cards hit the ceiling.
+DEFAULT_REVIEW_ROUND_LIMIT = 3
+
+
+def _review_round_count(conn: sqlite3.Connection, task_id: str) -> int:
+    """Completed review rounds that asked for changes, plus the round in flight.
+
+    ``request_changes`` is the only writer of the ``changes_requested`` outcome,
+    so this count is the loop length. Runs that crashed mid-review did not
+    produce a verdict and are not counted."""
+    done = conn.execute(
+        "SELECT COUNT(*) FROM task_runs WHERE task_id = ? AND outcome = 'changes_requested'",
+        (task_id,),
+    ).fetchone()[0]
+    return int(done) + 1
+
+
+def review_round_limit(conn: sqlite3.Connection, task_id: str) -> int:
+    """Per-card ceiling on review rounds.
+
+    The override is config, not a column: reading it from the tasks table
+    would need a migration on every existing database, and nothing has asked
+    for a per-card override yet. Add a column when someone does.
+    """
+    value = _review_round_limit_override()
+    return value if value > 0 else DEFAULT_REVIEW_ROUND_LIMIT
+
+
+def _review_round_limit_override() -> int:
+    """``kanban.review_round_limit`` from config; 0 when unset or junk."""
+    try:
+        from hermes_cli.config import load_config
+        value = (load_config().get("kanban") or {}).get("review_round_limit")
+    except Exception:
+        return 0
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
@@ -3521,6 +3564,53 @@ def request_changes(
             return False, "task is not in an active review run"
         if expected_run_id is not None and int(current_run_id) != int(expected_run_id):
             return False, "run_id mismatch"
+
+        # Rework circuit breaker. Measured over 5 days: cards with no review
+        # round averaged 106min/87% completion, cards with one or more averaged
+        # 502min/70%, and 6 cards reached 3+ rounds without ever completing
+        # (worst: 11). The loop does not converge on its own, so cap it and put
+        # the card in front of a human instead of requeuing it forever.
+        if _review_round_count(conn, task_id) >= review_round_limit(conn, task_id):
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'blocked',
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL, worker_started_at = NULL
+                 WHERE id = ? AND status = 'running' AND current_run_id = ?
+                """,
+                (task_id, int(current_run_id)),
+            )
+            if cur.rowcount != 1:
+                return False, "task changed during review round cap"
+            run_id = _end_run(
+                conn, task_id, outcome="changes_requested",
+                status="blocked", summary=reason,
+            )
+            _append_event(
+                conn, task_id, "review_round_limit",
+                {
+                    "rounds": _review_round_count(conn, task_id),
+                    "limit": review_round_limit(conn, task_id),
+                    "reason": reason,
+                },
+                run_id=run_id,
+            )
+            # Stuck-block semantics: only an explicit unblock may exit this,
+            # otherwise the dispatcher would re-queue it on the next sweep.
+            _append_event(
+                conn, task_id, "kanban_block",
+                {
+                    "reason": (
+                        f"review round limit reached "
+                        f"({review_round_limit(conn, task_id)})"
+                    ),
+                    "source": "review_round_limit",
+                },
+                run_id=run_id,
+            )
+            return False, "review round limit reached; card blocked for human review"
 
         claimed_event = _latest_event(conn, task_id, "claimed", current_run_id)
         claimed_payload = _json_dict(_row_get(claimed_event, "payload"))
