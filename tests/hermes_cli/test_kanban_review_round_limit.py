@@ -159,3 +159,43 @@ def test_crashed_review_does_not_consume_a_round(kanban_home: Path) -> None:
         )
         conn.commit()
         assert kb._review_round_count(conn, tid) == 1  # in-flight round only
+
+
+def test_escalation_blocks_consume_rounds(kanban_home: Path) -> None:
+    """THE REAL SPIN: a reviewer that escalates instead of passing.
+
+    t_fb4a7a97 emitted nine consecutive ``blocked`` reviewer runs ("ESCALATION
+    to coordinator, Nth dispatch, prior runs 721/1196/1199") before completing on
+    the tenth. A counter that only saw ``changes_requested`` never trips, so
+    the card re-dispatches forever.
+    """
+    assert kb._review_round_count.__doc__ is not None
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="escalates forever", assignee="reviewer")
+
+        for i in range(kb.DEFAULT_REVIEW_ROUND_LIMIT - 1):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, status, outcome, started_at) "
+                "VALUES (?, 'ended', 'blocked', ?)",
+                (tid, str(1000 + i)),
+            )
+        conn.commit()
+        # Two prior escalations + this one = 3, at the cap.
+        assert kb._review_round_count(conn, tid) == kb.DEFAULT_REVIEW_ROUND_LIMIT
+
+
+def test_mixed_changes_and_blocks_both_accumulate(kanban_home: Path) -> None:
+    """The two failure outcomes share one budget, not two of LIMIT each."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="mixed failures", assignee="reviewer")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at) "
+            "VALUES (?, 'ended', 'changes_requested', '1000')", (tid,),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at) "
+            "VALUES (?, 'ended', 'blocked', '1001')", (tid,),
+        )
+        conn.commit()
+        # 1 changes + 1 blocked + the round in flight = 3.
+        assert kb._review_round_count(conn, tid) == 3

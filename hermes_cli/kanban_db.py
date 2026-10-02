@@ -3141,12 +3141,22 @@ def edit_task(
     body: Optional[str] = None, priority: Optional[int] = None,
     result: Optional[str] = None, summary: Optional[str] = None,
     metadata: Optional[dict] = None, board: Optional[str] = None,
+    skills: Optional[list] = None,
 ) -> bool:
-    """Edit task fields, optionally backfilling a completed task's result."""
+    """Edit task fields, optionally backfilling a completed task's result.
+
+    ``skills`` replaces the pinned list wholesale. It is settable here because a
+    card can be created pinned to a skill name that does not exist, and until it
+    is clearable such a card fails identically on every dispatch forever
+    (measured 2026-10-01 on t_9699a711, pinned to the nonexistent
+    ``github-code-review``). Pass ``[]`` to clear the pin.
+    """
     changed_fields = [
         field for field, value in (("title", title), ("body", body), ("priority", priority))
         if value is not None
     ]
+    if skills is not None:
+        changed_fields.append("skills")
     with write_txn(conn):
         status = _task_status(conn, task_id)
         if status is None or (result is not None and status != "done"):
@@ -3157,6 +3167,10 @@ def edit_task(
             if value is not None:
                 assignments.append(f"{field} = ?")
                 params.append(value)
+        if skills is not None:
+            assignments.append("skills = ?")
+            params.append(json.dumps(list(skills)))
+
         if result is not None:
             assignments.append("result = ?")
             params.append(result)
@@ -3507,13 +3521,23 @@ DEFAULT_REVIEW_ROUND_LIMIT = 3
 
 
 def _review_round_count(conn: sqlite3.Connection, task_id: str) -> int:
-    """Completed review rounds that asked for changes, plus the round in flight.
+    """Completed review rounds that did NOT pass, plus the round in flight.
 
     ``request_changes`` is the only writer of the ``changes_requested`` outcome,
-    so this count is the loop length. Runs that crashed mid-review did not
-    produce a verdict and are not counted."""
+    so that count is the loop length. Runs that crashed mid-review did not
+    produce a verdict and are not counted.
+
+    ``blocked`` counts too. A reviewer that cannot reach a pass verdict has
+    escalated to a human, and re-dispatching it just repeats the same escalation:
+    ``t_fb4a7a97`` produced nine consecutive ``blocked`` reviewer runs ("ESCALATION
+    to coordinator, Nth dispatch, prior runs 721/1196/1199") before finally
+    completing on the tenth. Escalation is a request for judgment; re-running
+    the same agent cannot supply it. Only these two outcomes count -- a crash or
+    a rate-limit produced no verdict.
+    """
     done = conn.execute(
-        "SELECT COUNT(*) FROM task_runs WHERE task_id = ? AND outcome = 'changes_requested'",
+        "SELECT COUNT(*) FROM task_runs WHERE task_id = ? "
+        "AND outcome IN ('changes_requested', 'blocked')",
         (task_id,),
     ).fetchone()[0]
     return int(done) + 1
