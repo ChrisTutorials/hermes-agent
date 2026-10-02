@@ -70,6 +70,28 @@ _RESPAWN_BLOCKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+
+# Emitted by ``oneshot.SkillResolutionError`` when every pinned skill name is
+# unknown, so the run cannot start. Matched on the worker's last output, which is
+# the only place it surfaces: the worker dies before its first turn, so there is
+# no trailer and no dedicated exit code to key off (measured 2026-10-01,
+# t_9699a711 pinned to the nonexistent ``github-code-review``).
+_UNRESOLVABLE_SKILLS_MARKER = "None of the pinned skills exist"
+
+
+def _is_unresolvable_skills(dead: "_DeadWorker") -> bool:
+    """True when this death is "every pinned skill is unknown", not a crash.
+
+    Anchored on the full sentence so ordinary prose about skills in a worker's
+    progress output cannot park a healthy card — the same care
+    ``_RESPAWN_BLOCKER_RE`` takes with the ``auth`` stem.
+    """
+    if dead.unresolvable_skills:
+        return True
+    haystack = f"{dead.error_text} {dead.event_payload.get('worker_output', '')}"
+    return _UNRESOLVABLE_SKILLS_MARKER in haystack
+
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
@@ -1024,7 +1046,20 @@ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
 
 @dataclass
 class _DeadWorker:
-    """How ``detect_crashed_workers`` should book one dead worker."""
+    """How ``detect_crashed_workers`` should book one dead worker.
+
+    ``terminal_provider``: ``KANBAN_TERMINAL_PROVIDER_EXIT_CODE`` — the provider
+    rejected the worker's credential/model, and this trips the breaker on the
+    first occurrence.
+
+    ``unresolvable_skills``: every pinned skill name does not exist, so the run
+    cannot start at all. Distinct from a crash: nothing about the card is wrong,
+    the card's configuration is. Retrying cannot help, so this parks the card as
+    ``needs_input`` with the corrective command instead of burning the retry
+    budget (measured 2026-10-01, t_9699a711 pinned to the nonexistent
+    ``github-code-review`` failed identically on every dispatch while looking
+    merely slow rather than impossible).
+    """
 
     kind: str
     code: Optional[int]
@@ -1034,6 +1069,7 @@ class _DeadWorker:
     protocol_violation: bool = False
     rate_limited: bool = False
     terminal_provider: bool = False
+    unresolvable_skills: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
 
@@ -1059,6 +1095,20 @@ def _classify_dead_worker(
         if worker_output:
             dead.error_text += f" Worker's last output: {worker_output!r}"
             dead.event_payload["worker_output"] = worker_output
+        if _is_unresolvable_skills(dead):
+            # The card is pinned only to skill names that do not exist, so no
+            # amount of retrying starts a run. Same shape as a terminal provider
+            # rejection: unhealable without a configuration change. Reclassify it
+            # here so it parks as needs_input with the corrective command rather
+            # than reading as a slow card.
+            dead.error_text = (
+                f"pid {pid} could not start: every pinned skill does not exist "
+                f"({_UNRESOLVABLE_SKILLS_MARKER}) — clear the pin with "
+                f"`hermes kanban edit {task_id} --clear-skills`, then unblock."
+            )
+            dead.event_kind = "crashed"
+            dead.event_payload["unresolvable_skills"] = True
+            dead.unresolvable_skills = True
     return dead
 
 
@@ -1258,6 +1308,23 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                     "protocol_violations": streak,
                     "protocol_violation_limit": violation_limit,
                 },
+            )
+        elif dead.unresolvable_skills:
+            # No pinned skill exists, so no retry can start a run either. Same
+            # reasoning as ``terminal_provider``: spend the failure budget once
+            # and block immediately, or the card burns every retry on an outcome
+            # already known. Blocks as ``needs_input`` because the fix is a
+            # configuration edit (``--clear-skills``), not an operator judgement
+            # about the work — and that is what surfaces it to a human instead of
+            # leaving it looking merely slow.
+            tripped = _record_task_failure(
+                conn, tid,
+                error=error_text,
+                outcome="crashed",
+                force_trip=True,
+                release_claim=False,
+                end_run=False,
+                event_payload_extra={"pid": pid, "claimer": claimer, "unresolvable_skills": True},
             )
         elif dead.terminal_provider:
             # A retry cannot heal a revoked credential or a missing model, so
@@ -1877,6 +1944,39 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
+def configured_reserved_slots() -> dict:
+    """Read ``kanban.reserved_slots`` -> ``{board_slug: guaranteed_slots}``.
+
+    Chris's focus ruling, 2026-10-01: plugin code (grid-placement) takes
+    priority over the thistletide game board. ``max_in_progress`` is a HOST
+    cap shared by every board, so without a reservation the busiest board
+    claims the whole budget first and a quieter board sits idle with a full
+    queue -- observed as grid-placement at 30 ready / 0 running while default
+    held 6 of 9.
+
+    A reserved board may use the full host cap; every other board is held to
+    ``max_in_progress - its own reservation`` so the reserved board always has
+    somewhere to run. Absent config this is empty and the behaviour is exactly
+    what it was.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("reserved_slots")
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for slug, n in raw.items():
+        try:
+            ival = int(n)
+        except (TypeError, ValueError):
+            continue
+        if ival >= 1:
+            out[str(slug)] = ival
+    return out
+
+
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
@@ -2236,10 +2336,26 @@ def _tick_spawn_budget(
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
+        # Reserved board: may use the full host cap. Other boards are held to
+        # (cap - their reservation) so a reserved board always has headroom.
+        # See configured_reserved_slots for the focus ruling this encodes.
+        effective_cap = max_in_progress
+        try:
+            _slug = board or _kb.DEFAULT_BOARD
+        except Exception:
+            _slug = _kb.DEFAULT_BOARD
+        _reserved = configured_reserved_slots()
+        if _slug not in _reserved and _reserved:
+            try:
+                effective_cap = max_in_progress - max(_reserved.values())
+            except Exception:
+                effective_cap = max_in_progress
+            if effective_cap < 1:
+                return False, None
         total_running = running_count + count_running_tasks_other_boards(board)
-        if total_running >= max_in_progress:
+        if total_running >= effective_cap:
             return False, None
-        remaining = max_in_progress - total_running
+        remaining = effective_cap - total_running
         if spawn_budget is None or spawn_budget > remaining:
             spawn_budget = remaining
 
