@@ -3533,8 +3533,8 @@ def review_round_limit(conn: sqlite3.Connection, task_id: str) -> int:
 def _review_round_limit_override() -> int:
     """``kanban.review_round_limit`` from config; 0 when unset or junk."""
     try:
-        from hermes_cli.config import load_config
-        value = (load_config().get("kanban") or {}).get("review_round_limit")
+        from hermes_cli.config import load_config_readonly
+        value = (load_config_readonly().get("kanban") or {}).get("review_round_limit")
     except Exception:
         return 0
     try:
