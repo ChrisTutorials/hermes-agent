@@ -60,6 +60,12 @@ KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
 # (two default dispatch ticks).
 TERMINAL_WORKER_REAP_GRACE_SECONDS = 120
 
+# A card in one of these states owns no worker, so any scope still running under
+# its name is an orphan. A card in any other non-running state (blocked, review,
+# ready, todo) is NOT terminal: the worker legitimately exited or handed off, and
+# its scope is expected to unwind on its own.
+_TERMINAL_SCOPED_STATUSES = frozenset({"done", "archived"})
+
 # ---------------------------------------------------------------------------
 # Respawn guard constants
 # ---------------------------------------------------------------------------
@@ -143,6 +149,9 @@ class DispatchResult:
     reaped_terminal_workers: list[str] = field(default_factory=list)
     """Task ids whose worker outlived its closed run and was terminated by
     :func:`reap_terminal_workers`."""
+    reaped_orphan_scopes: list[str] = field(default_factory=list)
+    """Scope unit names stopped by :func:`reap_orphan_worker_scopes` because
+    their card was already terminal."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -570,6 +579,96 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
                 row["id"], row["task_id"], exc_info=True,
             )
     return reaped
+
+
+def reap_orphan_worker_scopes(conn: sqlite3.Connection, *, stop_fn=None) -> list[str]:
+    """Stop ``hermes-worker-kanban-*`` scopes whose card is no longer running.
+
+    The inverse of :func:`reap_terminal_workers`: that one kills a worker whose
+    run already ended, this one kills a *scope* whose card already left
+    ``running``.
+
+    ``systemd-run --collect`` only garbage-collects a scope once every process
+    in it exits. A worker that called ``kanban_complete`` and then hung (or
+    leaked a child) keeps the scope active indefinitely -- observed as
+    ``hermes-worker-kanban-t_3be306c5-run-778.scope`` holding 99 tasks and
+    334% CPU for an archived card. ``--collect`` cannot help: the unit is
+    still busy. Nothing else in the dispatcher looks at systemd scopes, so
+    these leak until an operator stops them by hand.
+
+    A scope is reaped only when its card is positively known to be finished:
+    the card is missing, or its status is terminal (``done``/``archived``), or
+    it points at a different run. A card still ``running`` on that same run is
+    left strictly alone -- a long wall time is not evidence of a leak.
+
+    Returns the scope unit names stopped. Best-effort: any systemctl failure
+    is logged and skips only that scope.
+    """
+    import re
+    import subprocess
+
+    prefix = "hermes-worker-kanban-"
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "list-units", f"{prefix}*.scope",
+             "--no-legend", "--plain", "--all", "--type=scope"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=20,
+        ).stdout
+    except Exception:
+        _kb._log.debug("kanban dispatch: scope enumeration failed", exc_info=True)
+        return []
+
+    reaped: list[str] = []
+    for line in out.splitlines():
+        unit = line.split()[0] if line.split() else ""
+        if not unit.startswith(prefix) or not unit.endswith(".scope"):
+            continue
+        match = re.match(rf"{prefix}(t_[0-9a-f]+)-run-(\d+)\.scope$", unit)
+        if not match:
+            continue  # not ours, or a name we do not recognise: never touch it
+        task_id, run_id = match.group(1), int(match.group(2))
+
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            reason = "card missing"
+        else:
+            status = row["status"]
+            current = int(row["current_run_id"] or 0)
+            # The card's own run. A worker still in it is in flight, and a
+            # non-terminal card (blocked/review/ready) is legitimately unwinding
+            # or waiting on the next dispatch -- neither is a leak.
+            if current == run_id and (
+                status == "running" or status not in _TERMINAL_SCOPED_STATUSES
+            ):
+                continue
+            reason = (
+                f"card {status}" if status in _TERMINAL_SCOPED_STATUSES
+                else "superseded run"
+            )
+        try:
+            (stop_fn or _stop_scope)(unit)
+        except Exception:
+            _kb._log.debug(
+                "kanban dispatch: stopping orphan scope %s failed", unit, exc_info=True,
+            )
+            continue
+        reaped.append(unit)
+        _kb._log.warning(
+            "kanban dispatch: stopped orphan worker scope %s (%s); it outlived its run "
+            "and --collect cannot reap a busy unit", unit, reason,
+        )
+    return reaped
+
+
+def _stop_scope(unit: str) -> None:
+    import subprocess
+
+    subprocess.run(
+        ["systemctl", "--user", "stop", unit], capture_output=True, timeout=30,
+    )
 
 
 def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: list[str]) -> None:
@@ -2333,6 +2432,7 @@ def _run_reclaim_phase(
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
+    result.reaped_orphan_scopes = reap_orphan_worker_scopes(conn)
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
