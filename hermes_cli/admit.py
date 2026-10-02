@@ -13,6 +13,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Mapping
@@ -111,7 +112,7 @@ def run_admitted_command(
         return proc.returncode
 
     if lock_path is None:
-        runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
         user_id = str(os.getuid()) if hasattr(os, "getuid") else getpass.getuser()
         lock_path = Path(runtime_dir) / f"hermes-heavy-admission-{user_id}.lock"
 
