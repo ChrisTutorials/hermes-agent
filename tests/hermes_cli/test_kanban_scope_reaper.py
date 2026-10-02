@@ -93,7 +93,94 @@ def test_review_card_scope_is_left_alone(kanban_home: Path, units) -> None:
         assert stopped == []
 
 
-def test_done_card_scope_is_reaped(kanban_home: Path, units) -> None:
+def test_live_run_is_never_reaped_even_when_card_is_invisible(
+    kanban_home: Path, units, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE PRODUCTION BUG: the reaper killed every worker at ~60s.
+
+    The dispatcher spawns inside an open write transaction. The scope name is
+    built from a Task snapshot before that transaction commits, so a reader
+    sees zero rows for a card that is alive and running. The first version
+    treated a missing row as proof of a dead card and stopped the scope --
+    every worker on the board died one dispatch tick later, logging
+    "(card missing)".
+
+    Here the card row is genuinely invisible to `conn`, but the run is live.
+    That must be enough to spare the scope.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="in flight", assignee="implementer")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        assert run_id is not None
+        unit = f"hermes-worker-kanban-{tid}-run-{run_id}.scope"
+        units["set"](unit)
+
+        # Reproduce the uncommitted-write case for real: the card and run are
+        # created on a SECOND connection inside an open write transaction, so
+        # `conn` -- the one the reaper reads -- sees nothing. A stubbed helper
+        # would not prove this; the invisibility has to be genuine.
+        writer = kbc.connect()
+        writer.execute("BEGIN IMMEDIATE")
+        hidden = kb.create_task(writer, title="in flight", assignee="implementer")
+        writer.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, hidden))
+        hidden_unit = f"hermes-worker-kanban-{hidden}-run-{run_id}.scope"
+        units["set"](hidden_unit)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE id = ?", (hidden,)
+        ).fetchone()[0] == 0, "precondition: reader must not see the row"
+
+        # The fresh probe reads committed state only, so it sees nothing either.
+        stopped: list[str] = []
+        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == []
+        assert stopped == [], "a live run must never be reaped"
+        writer.rollback()
+        writer.close()
+
+
+def test_invisible_card_is_reaped_once_its_run_is_dead(
+    kanban_home: Path, units, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both guards must agree: invisible card AND dead run is a real orphan."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="gone", assignee="implementer")
+        unit = f"hermes-worker-kanban-{tid}-run-999999.scope"
+        units["set"](unit)
+
+        monkeypatch.setattr(kbd, "_card_exists_freshly", lambda _tid: False)
+        monkeypatch.setattr(kbd, "_scope_run_is_live", lambda _rid: False)
+
+        stopped: list[str] = []
+        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == [unit]
+        assert stopped == [unit]
+
+
+def test_probe_failure_spares_the_scope(kanban_home: Path, units, monkeypatch) -> None:
+    """If we cannot prove it is dead, do not kill it.
+
+    Exercises the real failure path: the probe connection raises, and the
+    helpers' own ``except`` turns that into "assume alive".
+    """
+    import hermes_cli.kanban_db_connect as conn_mod
+
+    # Grab a real handle first; the patch below breaks every later connect().
+    conn = kbc.connect()
+    try:
+        def boom(*a, **kw):
+            raise RuntimeError("db gone")
+
+        monkeypatch.setattr(conn_mod, "connect", boom)
+
+        unit = "hermes-worker-kanban-t_ffff0000-run-777777.scope"
+        units["set"](unit)
+        stopped: list[str] = []
+        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == []
+        assert stopped == []
+    finally:
+        conn.close()
+
+
+def test_terminal_card_scope_is_reaped(kanban_home: Path, units) -> None:
     """LEAK: a completed card must not keep a scope alive."""
     with kbc.connect() as conn:
         tid, run_id = _claim(conn)

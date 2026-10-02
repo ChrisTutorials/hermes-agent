@@ -581,6 +581,38 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
     return reaped
 
 
+def _scope_run_is_live(run_id: int) -> bool:
+    """True while the run a scope was created for is still open.
+
+    The scope is named after the run that launched it, so a live run means a
+    live worker no matter what the parent card row looks like right now.
+    """
+    from hermes_cli import kanban_db_connect as _conn_mod
+
+    try:
+        with _conn_mod.connect() as probe:
+            row = probe.execute(
+                "SELECT status FROM task_runs WHERE id = ?", (run_id,),
+            ).fetchone()
+    except Exception:
+        # Cannot prove it is dead, so do not kill it.
+        return True
+    return row is not None and row["status"] == "running"
+
+
+def _card_exists_freshly(task_id: str) -> bool:
+    """Re-read the card on a fresh connection, past any open write snapshot."""
+    from hermes_cli import kanban_db_connect as _conn_mod
+
+    try:
+        with _conn_mod.connect() as probe:
+            return probe.execute(
+                "SELECT 1 FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone() is not None
+    except Exception:
+        return True  # cannot disprove; never reap on a failed check
+
+
 def reap_orphan_worker_scopes(conn: sqlite3.Connection, *, stop_fn=None) -> list[str]:
     """Stop ``hermes-worker-kanban-*`` scopes whose card is no longer running.
 
@@ -633,6 +665,22 @@ def reap_orphan_worker_scopes(conn: sqlite3.Connection, *, stop_fn=None) -> list
             "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
+            # A missing row is NOT evidence of a dead card. The dispatcher
+            # spawns inside an open write transaction: the scope name is built
+            # from a Task snapshot before that transaction commits, so a reader
+            # on another connection legitimately sees zero rows for a card that
+            # is alive and running. Verified against this board -- reaping on
+            # "card missing" killed every live worker at ~60s
+            # (run 1341/1342/1343, "card missing" in errors.log).
+            #
+            # Two independent guards, either of which is sufficient:
+            #   1. re-check on a fresh connection, in case this connection is
+            #      inside an uncommitted snapshot;
+            #   2. never reap while the run itself is still live.
+            if _scope_run_is_live(run_id):
+                continue
+            if _card_exists_freshly(task_id):
+                continue
             reason = "card missing"
         else:
             status = row["status"]
