@@ -35,6 +35,16 @@ if TYPE_CHECKING:
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
 
+# Free-disk thresholds for dispatch backpressure (MiB). Absolute, not a
+# percentage: the failure is an absolute one. Measured 2026-10-01, reviewer
+# cache/scratch alone went 51G -> 159G in hours and filled a 929G volume, and
+# t_dd15d08f died mid-review because its transcript would not save.
+# 20 GiB critical / 60 GiB elevated on a ~900 GiB volume: low enough to act
+# before the artifact-janitor's 30min cycle can finish reclaiming, high
+# enough that ordinary build and worktree churn never trips it.
+DISK_CRITICAL_MIB = 20 * 1024
+DISK_ELEVATED_MIB = 60 * 1024
+
 # Worker log files larger than this at spawn time are rotated.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
@@ -174,6 +184,10 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    disk_pressure: Optional[str] = None
+    """Free-disk pressure that restricted this tick, same vocabulary as
+    ``memory_pressure``. A worker that cannot persist its transcript exits and
+    loses its verdict, so low disk backs pressure off the same way."""
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -188,6 +202,7 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
     """
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
+    disk: Optional[str] = None
     for res in results:
         if res is None:
             continue
@@ -199,9 +214,13 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
+        if res.disk_pressure:
+            disk = res.disk_pressure
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
     if pressure:
         parts.append(f"memory_pressure={pressure}")
+    if disk:
+        parts.append(f"disk_pressure={disk}")
     return ", ".join(parts)
 
 
@@ -2050,6 +2069,28 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _disk_pressure_level(path: Optional[str] = None) -> str:
+    """Classify free-disk pressure: ok/elevated/critical/unknown.
+
+    Mirrors :func:`_memory_pressure_level`. Thresholds are absolute free space
+    rather than a percentage because the failure is absolute: a worker that
+    cannot write its transcript exits and loses its verdict. ``unknown`` (read
+    failure, non-Linux) imposes no restriction, so a statfs hiccup never bricks
+    dispatch.
+    """
+    try:
+        target = path or str(_kb.kanban_db_path().parent)
+        st = os.statvfs(target)
+        free_mib = st.f_bavail * st.f_frsize / (1024 * 1024)
+    except Exception:
+        return "unknown"
+    if free_mib < DISK_CRITICAL_MIB:
+        return "critical"
+    if free_mib < DISK_ELEVATED_MIB:
+        return "elevated"
+    return "ok"
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -2377,6 +2418,31 @@ def _tick_spawn_budget(
             _kb._log.warning(
                 "kanban dispatch: system memory pressure is elevated; "
                 "limiting to at most 1 new worker this tick"
+            )
+            spawn_budget = 1
+
+    # Disk backpressure. Measured 2026-10-01: the reviewer profile's
+    # cache/scratch grew 51G -> 84G in ~40min, filled the volume, and
+    # t_dd15d08f died with "couldn't save this conversation ... drive is out
+    # of room" -- a worker exiting on lost state rather than a clean error.
+    # The artifact-janitor timer reclaims, but it runs every 30min, so a fast
+    # burst can still outrun it. Memory has a guard here; disk had none.
+    disk = _disk_pressure_level()
+    if disk == "critical":
+        result.disk_pressure = disk
+        _kb._log.warning(
+            "kanban dispatch: free disk below %d MiB; spawning no new workers "
+            "this tick (deferred, not dropped)",
+            DISK_CRITICAL_MIB,
+        )
+        return False, None
+    if disk == "elevated":
+        result.disk_pressure = disk
+        if spawn_budget is None or spawn_budget > 1:
+            _kb._log.warning(
+                "kanban dispatch: free disk below %d MiB; limiting to at most "
+                "1 new worker this tick",
+                DISK_ELEVATED_MIB,
             )
             spawn_budget = 1
     return True, spawn_budget
