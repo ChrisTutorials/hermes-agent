@@ -785,6 +785,29 @@ def heartbeat_worker(
     return True
 
 
+def _default_max_runtime_seconds() -> Optional[int]:
+    """``kanban.max_runtime_seconds`` fallback for cards that set no limit.
+
+    Without this, a card with NULL ``max_runtime_seconds`` was never bounded:
+    a worker that hung held its scope, CPU and slot indefinitely. 0 means
+    "off" and keeps the historical behaviour; a positive value applies to
+    every card that does not opt in or out.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly().get("kanban") or {}).get(
+            "max_runtime_seconds"
+        )
+    except Exception:
+        return None
+    try:
+        value = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    # bool is an int: True would silently become a 1-second cap.
+    return value if value > 0 and not isinstance(raw, bool) else None
+
+
 def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
@@ -796,16 +819,20 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = _kb._host_prefix()
+    default_limit = _default_max_runtime_seconds()
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_started_at, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
+        "       COALESCE(t.max_runtime_seconds, ?) AS max_runtime_seconds, "
+        "       t.claim_lock "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
+        "WHERE t.status = 'running' "
+        "  AND COALESCE(t.max_runtime_seconds, ?) IS NOT NULL "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
-        "  AND t.worker_pid IS NOT NULL"
+        "  AND t.worker_pid IS NOT NULL",
+        (default_limit, default_limit),
     ).fetchall()
     for row in rows:
         lock = row["claim_lock"] or ""
