@@ -1,0 +1,502 @@
+"""Orphan worker-scope reaper.
+
+Observed on the live box: ``hermes-worker-kanban-t_3be306c5-run-778.scope``
+held 99 tasks and 334% CPU for a card that no longer existed in the database,
+and ``-run-776.scope`` held 33 tasks for an archived card.
+``systemd-run --collect`` cannot reap either: --collect only fires once every
+process in the scope exits, and a hung worker never exits.
+
+What matters most is the safety property -- a worker legitimately in flight is
+never touched -- so that is tested first and most explicitly.
+"""
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+
+
+@pytest.fixture
+def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    return home
+
+
+@pytest.fixture
+def units(monkeypatch: pytest.MonkeyPatch):
+    """Serve a systemctl list-units table; yields a setter for unit names."""
+    table = {"names": []}
+
+    def fake_run(cmd, **kwargs):
+        if "list-units" in cmd:
+            listing = "".join(f"{n} loaded active running w\n" for n in table["names"])
+            return subprocess.CompletedProcess(cmd, 0, listing, "")
+        raise AssertionError(f"unexpected systemctl call: {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    table["set"] = lambda *names: table.__setitem__("names", list(names))
+    return table
+
+
+def _claim(conn, title: str = "card") -> tuple[str, int]:
+    """Create + claim a card, returning (task_id, run_id)."""
+    tid = kb.create_task(conn, title=title, assignee="implementer")
+    kb.claim_task(conn, tid)
+    run_id = kb.get_task(conn, tid).current_run_id
+    assert run_id is not None
+    return tid, int(run_id)
+
+
+def test_running_card_scope_is_never_stopped(kanban_home: Path, units) -> None:
+    """SAFETY: real work in flight is left strictly alone."""
+    with kbc.connect() as conn:
+        tid, run_id = _claim(conn)
+        units["set"](f"hermes-worker-kanban-{tid}-run-{run_id}.scope")
+
+        stopped: list[str] = []
+        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == []
+        assert stopped == []
+
+
+def test_blocked_card_scope_is_left_alone(kanban_home: Path, units) -> None:
+    """blocked is not terminal: a worker may legitimately be unwinding."""
+    with kbc.connect() as conn:
+        tid, run_id = _claim(conn)
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        conn.commit()
+        units["set"](f"hermes-worker-kanban-{tid}-run-{run_id}.scope")
+
+        stopped: list[str] = []
+        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == []
+        assert stopped == []
+
+
+def test_review_card_scope_is_left_alone(kanban_home: Path, units) -> None:
+    """review hands off to another worker; not terminal either."""
+    with kbc.connect() as conn:
+        tid, run_id = _claim(conn)
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
+        conn.commit()
+        units["set"](f"hermes-worker-kanban-{tid}-run-{run_id}.scope")
+
+        stopped: list[str] = []
+        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == []
+        assert stopped == []
+
+
+def test_live_run_is_never_reaped_even_when_card_is_invisible(
+    kanban_home: Path, units, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE PRODUCTION BUG: the reaper killed every worker at ~60s.
+
+    The dispatcher spawns inside an open write transaction. The scope name is
+    built from a Task snapshot before that transaction commits, so a reader
+    sees zero rows for a card that is alive and running. The first version
+    treated a missing row as proof of a dead card and stopped the scope --
+    every worker on the board died one dispatch tick later, logging
+    "(card missing)".
+
+    Here the card row is genuinely invisible to `conn`, but the run is live.
+    That must be enough to spare the scope.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="in flight", assignee="implementer")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        assert run_id is not None
+        unit = f"hermes-worker-kanban-{tid}-run-{run_id}.scope"
+        units["set"](unit)
+
+        # Reproduce the uncommitted-write case for real: the card and run are
+        # created on a SECOND connection inside an open write transaction, so
+        # `conn` -- the one the reaper reads -- sees nothing. A stubbed helper
+        # would not prove this; the invisibility has to be genuine.
+        # connect_closing, not `with connect()`: sqlite3's context manager
+        # commits but does NOT close the fd. A bare handle here held a write
+        # lock open and hung the rest of the suite.
+        with kbc.connect_closing() as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            hidden = kb.create_task(writer, title="in flight", assignee="implementer")
+            writer.execute(
+                "UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, hidden)
+            )
+            hidden_unit = f"hermes-worker-kanban-{hidden}-run-{run_id}.scope"
+            units["set"](hidden_unit)
+            assert conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE id = ?", (hidden,)
+            ).fetchone()[0] == 0, "precondition: reader must not see the row"
+
+            # The fresh probe reads committed state only, so it sees nothing.
+            stopped: list[str] = []
+            assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == []
+            assert stopped == [], "a live run must never be reaped"
+            writer.rollback()
+
+
+def test_invisible_card_is_reaped_once_its_run_is_dead(
+    kanban_home: Path, units, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both guards must agree: invisible card AND dead run is a real orphan."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="gone", assignee="implementer")
+        unit = f"hermes-worker-kanban-{tid}-run-999999.scope"
+        units["set"](unit)
+
+        monkeypatch.setattr(kbd, "_card_exists_freshly", lambda _c, _tid: False)
+        monkeypatch.setattr(kbd, "_scope_run_is_live", lambda _c, _rid: False)
+
+        stopped: list[str] = []
+        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == [unit]
+        assert stopped == [unit]
+
+
+def test_probe_failure_spares_the_scope(kanban_home: Path, units) -> None:
+    """If we cannot prove it is dead, do not kill it.
+
+    A closed/unusable board must stop the reaper, not empty the machine. This
+    is the fail-closed contract: both helpers catch and answer "assume alive".
+    """
+    # No `with`: its __exit__ commits, which would itself raise on the closed
+    # handle and mask what this test is checking.
+    conn = kbc.connect()
+    try:
+        unit = "hermes-worker-kanban-t_ffff0000-run-777777.scope"
+        units["set"](unit)
+
+        # Kill the handle so every query raises -- what a dead board looks like.
+        conn.close()
+
+        assert kbd._scope_run_is_live(conn, 777777) is True
+        assert kbd._card_exists_freshly(conn, "t_ffff0000") is True
+
+        stopped: list[str] = []
+        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == []
+        assert stopped == []
+    finally:
+        pass  # already closed
+
+
+def test_terminal_card_scope_is_reaped(kanban_home: Path, units) -> None:
+    """LEAK: a completed card must not keep a scope alive."""
+    with kbc.connect() as conn:
+        tid, run_id = _claim(conn)
+        kb.complete_task(conn, tid, summary="shipped it")
+        unit = f"hermes-worker-kanban-{tid}-run-{run_id}.scope"
+        units["set"](unit)
+
+        stopped: list[str] = []
+        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == [unit]
+        assert stopped == [unit]
+
+
+def test_missing_card_scope_is_reaped(kanban_home: Path, units) -> None:
+    """LEAK: the exact live incident -- the card is gone from the database."""
+    unit = "hermes-worker-kanban-t_deadbeef-run-776.scope"
+    units["set"](unit)
+
+    with kbc.connect() as conn:
+        stopped: list[str] = []
+        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == [unit]
+        assert stopped == [unit]
+
+
+def test_superseded_run_scope_is_reaped(kanban_home: Path, units) -> None:
+    """A scope for an OLD run of a still-open card is still an orphan."""
+    with kbc.connect() as conn:
+        tid, run_id = _claim(conn)
+        stale = f"hermes-worker-kanban-{tid}-run-{run_id - 1}.scope"
+        live = f"hermes-worker-kanban-{tid}-run-{run_id}.scope"
+        units["set"](stale, live)
+
+        stopped: list[str] = []
+        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == [stale]
+        assert stopped == [stale]
+
+
+def test_unrecognised_unit_names_are_never_stopped(kanban_home: Path, units) -> None:
+    """Anything not matching our exact pattern is off limits."""
+    units["set"](
+        "hermes-worker-kanban-run-5.scope",
+        "hermes-gateway.service",
+        "hermes-worker-kanban-t_abcDE-run-7.scope",
+    )
+
+    with kbc.connect() as conn:
+        stopped: list[str] = []
+        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == []
+        assert stopped == []
+
+
+def test_stop_failure_does_not_abort_the_sweep(kanban_home: Path, units) -> None:
+    """One bad stop skips that scope, not the rest of the tick."""
+    good = "hermes-worker-kanban-t_aaa11111-run-1.scope"
+    bad = "hermes-worker-kanban-t_bbb22222-run-2.scope"
+    units["set"](good, bad)
+
+    def flaky(unit: str) -> None:
+        if unit == bad:
+            raise RuntimeError("systemctl exploded")
+
+    with kbc.connect() as conn:
+        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=flaky) == [good]
+
+
+def test_systemctl_failure_returns_empty(kanban_home: Path, monkeypatch) -> None:
+    """No user bus is a host condition: reaping nothing is correct, not an error."""
+    def boom(cmd, **kwargs):
+        raise FileNotFoundError("systemctl")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    with kbc.connect() as conn:
+        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=lambda u: None) == []
+
+
+# --- multi-board: a scope name carries only the card id -------------------------
+
+@pytest.fixture
+def other_board(kanban_home: Path):
+    """A second board under the same kanban home; yields its slug."""
+    slug = "grid-placement"
+    kb.create_board(slug)
+    return slug
+
+
+def test_card_live_on_another_board_is_never_reaped(
+    kanban_home: Path, other_board: str, units,
+) -> None:
+    """THE MULTI-BOARD BUG: each board's tick judged every OTHER board's workers.
+
+    A scope name is just ``hermes-worker-kanban-<card id>-run-<n>``, so the
+    ``default`` tick saw grid-placement's scope, found no row on its own DB,
+    and stopped it -- four reaps in a row for a card that was running the whole
+    time. Only the card id is in scope across boards, so the other board's DB
+    is the only thing that can answer "is this card alive".
+    """
+    with kbc.connect_closing(board=other_board) as owner:
+        tid, run_id = _claim(owner, title="grid placement work")
+        unit = f"hermes-worker-kanban-{tid}-run-{run_id}.scope"
+        units["set"](unit)
+
+        with kbc.connect_closing(board="default") as other:
+            stopped: list[str] = []
+            assert kbd.reap_orphan_worker_scopes(other, stop_fn=stopped.append) == []
+            assert stopped == [], "another board's live worker must never be stopped"
+
+        # The owning board still sees its own card and leaves it alone too.
+        with kbc.connect_closing(board=other_board) as owner2:
+            assert kbd.reap_orphan_worker_scopes(owner2, stop_fn=lambda u: None) == []
+
+
+def test_running_card_on_another_board_is_not_reaped_by_a_dead_run_id(
+    kanban_home: Path, other_board: str, units,
+) -> None:
+    """The cross-board probe must not depend on the run id matching the owner.
+
+    The run id is per-board, so this board's ``task_runs`` genuinely has no row
+    for the other board's run. The card row on its own board is the evidence.
+    """
+    with kbc.connect_closing(board=other_board) as owner:
+        tid, _run_id = _claim(owner, title="grid work")
+        # A run id that exists nowhere at all.
+        unit = f"hermes-worker-kanban-{tid}-run-424242.scope"
+        units["set"](unit)
+
+        with kbc.connect_closing(board="default") as other:
+            assert kbd.reap_orphan_worker_scopes(other, stop_fn=lambda u: None) == []
+
+
+def test_a_card_on_no_board_at_all_is_still_reaped(
+    kanban_home: Path, other_board: str, units,
+) -> None:
+    """The cross-board probe must not make the reaper unable to reap anything.
+
+    It is a guard against FALSE "card missing", not a replacement for it: a
+    card that exists on no board is the leak this reaper exists to stop.
+    """
+    unit = "hermes-worker-kanban-t_deadbee1-run-776.scope"
+    units["set"](unit)
+    with kbc.connect_closing(board="default") as conn:
+        stopped: list[str] = []
+        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == [unit]
+        assert stopped == [unit]
+
+
+def test_unreadable_other_board_fails_closed(
+    kanban_home: Path, other_board: str, units, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A board we cannot read might hold the card, so we must not reap.
+
+    Fail-closed, like every other probe here: an unreadable board answers
+    "assume the card is alive", never "reap".
+    """
+    unit = "hermes-worker-kanban-t_ffff0001-run-777777.scope"
+    units["set"](unit)
+
+    # A real file that is not a SQLite DB: the probe's own connect() raises on
+    # it, which is exactly the "another board we cannot read" case.
+    junk = kanban_home / "kanban" / "boards" / "junk" / "kanban.db"
+    junk.parent.mkdir(parents=True, exist_ok=True)
+    junk.write_bytes(b"this is not a sqlite database")
+
+    monkeypatch.setattr(kbd, "_other_board_readonly_candidates",
+                        lambda _c: [junk])
+
+    with kbc.connect_closing(board="default") as conn:
+        stopped: list[str] = []
+        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == []
+        assert stopped == []
+
+
+def test_zero_byte_board_placeholder_is_never_probed(
+    kanban_home: Path, units,
+) -> None:
+    """``boards/<slug>/kanban.db`` can exist as a 0-byte file with no schema.
+
+    Querying one raises ``no such table: tasks``; the reaper must skip it, not
+    treat the error as a reason to reap.
+    """
+    placeholder = kb.board_dir("empty") / "kanban.db"
+    placeholder.parent.mkdir(parents=True, exist_ok=True)
+    placeholder.write_bytes(b"")
+
+    with kbc.connect_closing(board="default") as conn:
+        paths = kbd._other_board_readonly_candidates(conn)
+        assert placeholder not in paths
+        assert all(p.stat().st_size > 0 for p in paths)
+
+
+def _mirror_card(
+    source_conn, target_conn, task_id: str, *, status: str, current_run_id=None,
+) -> None:
+    """Write a copy of ``task_id``'s row onto ``target_conn`` with a given status.
+
+    The duplication is a known, separate defect (``board=`` is silently ignored on
+    the coordinator profile, so a card created for one board lands on another).
+    It is reproduced here deliberately: the reaper must TOLERATE a
+    terminally-stale row on the wrong board, not try to clean it up.
+    """
+    row = source_conn.execute(
+        "SELECT * FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    assert row is not None, "precondition: the card must exist on the source board"
+    cols = [d[0] for d in source_conn.execute(
+        "SELECT * FROM tasks WHERE id = ?", (task_id,),
+    ).description]
+    placeholders = ", ".join("?" for _ in cols)
+    target_conn.execute(
+        "INSERT OR REPLACE INTO tasks (%s) VALUES (%s)" % (", ".join(cols), placeholders),
+        [status if c == "status" else (current_run_id if c == "current_run_id" else row[i])
+         for i, c in enumerate(cols)],
+    )
+
+
+def test_terminal_row_here_and_live_row_elsewhere_is_never_reaped(
+    kanban_home: Path, other_board: str, units,
+) -> None:
+    """THE BRANCH THE LANDED SUITE MISSED: ``else`` never consults another board.
+
+    The three multi-board tests above all leave the card ABSENT on the caller's
+    board, so they only ever exercise the ``row is None`` branch -- where the
+    cross-board guard sits. A card that DOES have a row here, in any status,
+    takes the ``else`` branch, which never asks another board anything.
+
+    Measured consequence (coordinator sweep 71): a card ``archived`` on
+    ``default`` and ``blocked`` on ``grid-placement`` had its LIVE grid-placement
+    worker stopped by ``default``'s tick six times in two hours, each logged
+    ``(card archived)`` -- the ``else`` branch, not "card missing". The scope name
+    carries the card id and no board slug, so ``default`` judged a scope that
+    belonged to ``grid-placement``.
+    """
+    # The card is owned by grid-placement and genuinely RUNNING there.
+    with kbc.connect_closing(board=other_board) as owner:
+        tid, run_id = _claim(owner, title="grid placement work")
+        unit = f"hermes-worker-kanban-{tid}-run-{run_id}.scope"
+        units["set"](unit)
+        other_status = kb.get_task(owner, tid).status
+        assert other_status == "running"
+
+        # default holds a terminally-stale duplicate of the same id.
+        with kbc.connect_closing(board="default") as stale:
+            _mirror_card(owner, stale, tid, status="archived",
+                         current_run_id=run_id)
+
+            stopped: list[str] = []
+            assert kbd.reap_orphan_worker_scopes(stale, stop_fn=stopped.append) == []
+            assert stopped == [], (
+                "default's terminal row must not stop grid-placement's live worker"
+            )
+
+    # Control: the guard is `live`, not `present`. Once the card is terminal on
+    # EVERY board it is a genuine orphan and must be reaped -- otherwise this
+    # fix would have turned the reaper into a no-op and leaked every scope.
+    with kbc.connect_closing(board=other_board) as owner:
+        kb.archive_task(owner, tid)
+    with kbc.connect_closing(board="default") as alone:
+        stopped = []
+        assert kbd.reap_orphan_worker_scopes(alone, stop_fn=stopped.append) == [unit]
+        assert stopped == [unit], (
+            "a card terminal on every board is a real leak and must still be reaped"
+        )
+
+
+@pytest.mark.parametrize(
+    "status_here, expect_reaped",
+    [
+        ("archived", False),   # terminal here, live elsewhere  -> spare
+        ("done",     False),   # the other terminal status    -> spare
+        ("blocked",  False),   # non-terminal here, run id is the other board's
+        ("running",  False),
+    ],
+)
+def test_any_local_row_spares_a_scope_that_is_live_on_another_board(
+    kanban_home: Path, other_board: str, units,
+    status_here: str, expect_reaped: bool,
+) -> None:
+    """The guard is on the DECISION to stop, not on the reason string.
+
+    Parametrised over the local status so the guard cannot be satisfied by a
+    single special-cased value: whatever this board's row says, a card that is
+    alive on another board is not this board's orphan to reap.
+    """
+    with kbc.connect_closing(board=other_board) as owner:
+        tid, run_id = _claim(owner, title="grid work")
+        unit = f"hermes-worker-kanban-{tid}-run-{run_id}.scope"
+        units["set"](unit)
+        with kbc.connect_closing(board="default") as other:
+            _mirror_card(owner, other, tid, status=status_here,
+                         current_run_id=run_id)
+            stopped: list[str] = []
+            got = kbd.reap_orphan_worker_scopes(other, stop_fn=stopped.append)
+            if expect_reaped:
+                assert got == [unit]
+            else:
+                assert got == [], f"status={status_here} must spare a live-elsewhere card"
+                assert stopped == []
+
+
+def test_probe_never_opens_a_second_connection_to_the_callers_board(
+    kanban_home: Path, other_board: str, units,
+) -> None:
+    """2909317a6c: a second connection to the SAME board deadlocks.
+
+    The reaper runs inside the dispatcher's write transaction, so a nested read
+    on its own board blocks forever behind the lock its caller holds. The
+    cross-board probe must resolve the caller's own DB out of the candidate
+    set by path.
+    """
+    with kbc.connect_closing(board="default") as conn:
+        paths = kbd._other_board_readonly_candidates(conn)
+        own_file = kbc._main_db_file(conn)
+        assert own_file is not None
+        own = Path(own_file).resolve()
+        assert own not in [p.resolve() for p in paths]
+        assert paths, "the other board must still be probed"
