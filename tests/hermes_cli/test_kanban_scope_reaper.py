@@ -258,3 +258,136 @@ def test_systemctl_failure_returns_empty(kanban_home: Path, monkeypatch) -> None
     monkeypatch.setattr(subprocess, "run", boom)
     with kbc.connect() as conn:
         assert kbd.reap_orphan_worker_scopes(conn, stop_fn=lambda u: None) == []
+
+
+# --- multi-board: a scope name carries only the card id -------------------------
+
+@pytest.fixture
+def other_board(kanban_home: Path):
+    """A second board under the same kanban home; yields its slug."""
+    slug = "grid-placement"
+    kb.create_board(slug)
+    return slug
+
+
+def test_card_live_on_another_board_is_never_reaped(
+    kanban_home: Path, other_board: str, units,
+) -> None:
+    """THE MULTI-BOARD BUG: each board's tick judged every OTHER board's workers.
+
+    A scope name is just ``hermes-worker-kanban-<card id>-run-<n>``, so the
+    ``default`` tick saw grid-placement's scope, found no row on its own DB,
+    and stopped it -- four reaps in a row for a card that was running the whole
+    time. Only the card id is in scope across boards, so the other board's DB
+    is the only thing that can answer "is this card alive".
+    """
+    with kbc.connect_closing(board=other_board) as owner:
+        tid, run_id = _claim(owner, title="grid placement work")
+        unit = f"hermes-worker-kanban-{tid}-run-{run_id}.scope"
+        units["set"](unit)
+
+        with kbc.connect_closing(board="default") as other:
+            stopped: list[str] = []
+            assert kbd.reap_orphan_worker_scopes(other, stop_fn=stopped.append) == []
+            assert stopped == [], "another board's live worker must never be stopped"
+
+        # The owning board still sees its own card and leaves it alone too.
+        with kbc.connect_closing(board=other_board) as owner2:
+            assert kbd.reap_orphan_worker_scopes(owner2, stop_fn=lambda u: None) == []
+
+
+def test_running_card_on_another_board_is_not_reaped_by_a_dead_run_id(
+    kanban_home: Path, other_board: str, units,
+) -> None:
+    """The cross-board probe must not depend on the run id matching the owner.
+
+    The run id is per-board, so this board's ``task_runs`` genuinely has no row
+    for the other board's run. The card row on its own board is the evidence.
+    """
+    with kbc.connect_closing(board=other_board) as owner:
+        tid, _run_id = _claim(owner, title="grid work")
+        # A run id that exists nowhere at all.
+        unit = f"hermes-worker-kanban-{tid}-run-424242.scope"
+        units["set"](unit)
+
+        with kbc.connect_closing(board="default") as other:
+            assert kbd.reap_orphan_worker_scopes(other, stop_fn=lambda u: None) == []
+
+
+def test_a_card_on_no_board_at_all_is_still_reaped(
+    kanban_home: Path, other_board: str, units,
+) -> None:
+    """The cross-board probe must not make the reaper unable to reap anything.
+
+    It is a guard against FALSE "card missing", not a replacement for it: a
+    card that exists on no board is the leak this reaper exists to stop.
+    """
+    unit = "hermes-worker-kanban-t_deadbee1-run-776.scope"
+    units["set"](unit)
+    with kbc.connect_closing(board="default") as conn:
+        stopped: list[str] = []
+        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == [unit]
+        assert stopped == [unit]
+
+
+def test_unreadable_other_board_fails_closed(
+    kanban_home: Path, other_board: str, units, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A board we cannot read might hold the card, so we must not reap.
+
+    Fail-closed, like every other probe here: an unreadable board answers
+    "assume the card is alive", never "reap".
+    """
+    unit = "hermes-worker-kanban-t_ffff0001-run-777777.scope"
+    units["set"](unit)
+
+    # A real file that is not a SQLite DB: the probe's own connect() raises on
+    # it, which is exactly the "another board we cannot read" case.
+    junk = kanban_home / "kanban" / "boards" / "junk" / "kanban.db"
+    junk.parent.mkdir(parents=True, exist_ok=True)
+    junk.write_bytes(b"this is not a sqlite database")
+
+    monkeypatch.setattr(kbd, "_other_board_readonly_candidates",
+                        lambda _c: [junk])
+
+    with kbc.connect_closing(board="default") as conn:
+        stopped: list[str] = []
+        assert kbd.reap_orphan_worker_scopes(conn, stop_fn=stopped.append) == []
+        assert stopped == []
+
+
+def test_zero_byte_board_placeholder_is_never_probed(
+    kanban_home: Path, units,
+) -> None:
+    """``boards/<slug>/kanban.db`` can exist as a 0-byte file with no schema.
+
+    Querying one raises ``no such table: tasks``; the reaper must skip it, not
+    treat the error as a reason to reap.
+    """
+    placeholder = kb.board_dir("empty") / "kanban.db"
+    placeholder.parent.mkdir(parents=True, exist_ok=True)
+    placeholder.write_bytes(b"")
+
+    with kbc.connect_closing(board="default") as conn:
+        paths = kbd._other_board_readonly_candidates(conn)
+        assert placeholder not in paths
+        assert all(p.stat().st_size > 0 for p in paths)
+
+
+def test_probe_never_opens_a_second_connection_to_the_callers_board(
+    kanban_home: Path, other_board: str, units,
+) -> None:
+    """2909317a6c: a second connection to the SAME board deadlocks.
+
+    The reaper runs inside the dispatcher's write transaction, so a nested read
+    on its own board blocks forever behind the lock its caller holds. The
+    cross-board probe must resolve the caller's own DB out of the candidate
+    set by path.
+    """
+    with kbc.connect_closing(board="default") as conn:
+        paths = kbd._other_board_readonly_candidates(conn)
+        own_file = kbc._main_db_file(conn)
+        assert own_file is not None
+        own = Path(own_file).resolve()
+        assert own not in [p.resolve() for p in paths]
+        assert paths, "the other board must still be probed"

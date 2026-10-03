@@ -89,7 +89,23 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
+    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/(?P<num>\d+)",
+    re.IGNORECASE,
+)
+
+# A card names its own PR in its title ("thistletide PR #3933 head ...") or in
+# its idempotency key (``github:<owner>/<repo>:pr:<n>[:suffix]`` natively,
+# ``pr-landing:<short>#<n>`` for the legacy landing cards). BOTH are read: the
+# title is what a human reads on the dashboard, the key is what dedupes the
+# card, and either alone is enough to scope the guard.
+_RESPAWN_GUARD_OWN_PR_TITLE_RE = re.compile(
+    r"\bPR\s*#?\s*(?P<num>\d+)"          # "PR #3933", "PR3933"
+    r"|/pull/(?P<num2>\d+)",             # a PR URL pasted into the title
+    re.IGNORECASE,
+)
+_RESPAWN_GUARD_OWN_PR_KEY_RE = re.compile(
+    r":pr:(?P<num>\d+)"                  # github:owner/repo:pr:3933[:suffix]
+    r"|#(?P<num2>\d+)\b",                # pr-landing:thistletide-gd#3933
     re.IGNORECASE,
 )
 
@@ -574,6 +590,78 @@ def _card_exists_freshly(conn: sqlite3.Connection, task_id: str) -> bool:
         return True  # cannot disprove; never reap on a failed check
 
 
+def _other_board_readonly_candidates(
+    conn: sqlite3.Connection,
+) -> list[Path]:
+    """DB files of every board EXCEPT the one ``conn`` owns.
+
+    Resolved-path identity, the same rule
+    :func:`count_running_tasks_other_boards` uses, so ``HERMES_KANBAN_DB``
+    (which pins every board slug to one file) yields nothing to probe. Zero-byte
+    placeholders are dropped: ``boards/<slug>/kanban.db`` can exist as an empty
+    file with no schema, and a query against one raises.
+    """
+    try:
+        own = _kbc._main_db_file(conn)
+        own_resolved = str(Path(own).expanduser().resolve()) if own else None
+    except Exception:
+        own_resolved = None
+    try:
+        boards = _kb.list_boards(include_archived=False)
+    except Exception:
+        return []
+    candidates: list[Path] = []
+    for meta in boards:
+        slug = meta.get("slug") or _kb.DEFAULT_BOARD
+        try:
+            path = _kb.kanban_db_path(board=slug).expanduser()
+            resolved = path.resolve()
+            if own_resolved is not None and str(resolved) == own_resolved:
+                continue  # never a second connection to the caller's own board
+            if not path.exists() or path.stat().st_size == 0:
+                continue
+            candidates.append(path)
+        except Exception:
+            continue
+    return candidates
+
+
+def _card_seen_on_another_board(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether ANY other board holds a row for ``task_id``.
+
+    ``True`` also covers "could not tell": an unreadable other board is
+    treated as possibly holding the card, because the fail-closed answer here
+    is "do not reap". Read-only (``mode=ro``) so a probe cannot take another
+    board's write lock or mutate it — the deadlock that stopped
+    :func:`_scope_run_is_live` from ever getting a second connection applies to
+    the SAME board, which this never touches.
+    """
+    for path in _other_board_readonly_candidates(conn):
+        other = None
+        try:
+            other = sqlite3.connect(
+                path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0,
+            )
+            other.row_factory = sqlite3.Row
+            row = other.execute(
+                "SELECT 1 FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if row is not None:
+                return True
+        except Exception:
+            _kb._log.debug(
+                "kanban dispatch: cross-board card probe failed for %s; "
+                "treating the card as present (fail closed)",
+                path, exc_info=True,
+            )
+            return True
+        finally:
+            if other is not None:
+                with contextlib.suppress(Exception):
+                    other.close()
+    return False
+
+
 def reap_orphan_worker_scopes(conn: sqlite3.Connection, *, stop_fn=None) -> list[str]:
     """Stop ``hermes-worker-kanban-*`` scopes whose card is no longer running.
 
@@ -590,9 +678,10 @@ def reap_orphan_worker_scopes(conn: sqlite3.Connection, *, stop_fn=None) -> list
     these leak until an operator stops them by hand.
 
     A scope is reaped only when its card is positively known to be finished:
-    the card is missing, or its status is terminal (``done``/``archived``), or
-    it points at a different run. A card still ``running`` on that same run is
-    left strictly alone -- a long wall time is not evidence of a leak.
+    the card is missing on this board AND on every other board, or its status
+    is terminal (``done``/``archived``), or it points at a different run. A
+    card still ``running`` on that same run is left strictly alone -- a long
+    wall time is not evidence of a leak.
 
     Returns the scope unit names stopped. Best-effort: any systemctl failure
     is logged and skips only that scope.
@@ -650,6 +739,13 @@ def reap_orphan_worker_scopes(conn: sqlite3.Connection, *, stop_fn=None) -> list
             if _scope_run_is_live(conn, run_id):
                 continue
             if _card_exists_freshly(conn, task_id):
+                continue
+            # ...and neither can see ANOTHER board's rows. A scope name carries
+            # only the card id, so `default`'s tick used to judge grid-placement's
+            # live workers, find no row, and stop them -- four reaps in a row for
+            # a card that was running the whole time. Consult the other boards
+            # before declaring the card missing; their own tick judges them.
+            if _card_seen_on_another_board(conn, task_id):
                 continue
             reason = "card missing"
         else:
@@ -1680,6 +1776,54 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _card_own_pr_numbers(row) -> set[str]:
+    """PR numbers the CARD itself claims, from its title and idempotency key.
+
+    Empty when the card names no PR at all (a defect card, a sweep, a plain
+    implementation task). Empty is NOT "hold everything" -- the caller decides.
+    """
+    numbers: set[str] = set()
+    for field, pattern in (
+        (_kb._lossy_text(row["title"]), _RESPAWN_GUARD_OWN_PR_TITLE_RE),
+        (_kb._lossy_text(row["idempotency_key"]), _RESPAWN_GUARD_OWN_PR_KEY_RE),
+    ):
+        if not field:
+            continue
+        for match in pattern.finditer(field):
+            numbers.update(n for n in match.groupdict().values() if n)
+    return numbers
+
+
+def _card_worker_authors(conn: sqlite3.Connection, row) -> Optional[set[str]]:
+    """Profiles whose comment on this card is evidence of worker work.
+
+    DERIVED, never a hand-written roster: the card's current assignee plus
+    every profile that actually holds a run on it. A coordinator/automation
+    profile never runs cards, so its notes cannot re-arm a duplicate-work
+    guard; a worker that opened the PR always appears in one of the two.
+
+    ``None`` means the card names no worker at all (no assignee, no run
+    history) -- nothing is knowable, so the caller keeps today's behaviour
+    rather than silently opening the guard.
+    """
+    authors = set()
+    assignee = _kb._lossy_text(row["assignee"] or "")
+    if assignee:
+        authors.add(assignee)
+    try:
+        for run in conn.execute(
+            "SELECT DISTINCT profile FROM task_runs WHERE task_id = ? "
+            "AND profile IS NOT NULL",
+            (row["id"],),
+        ).fetchall():
+            profile = _kb._lossy_text(run["profile"] or "")
+            if profile:
+                authors.add(profile)
+    except Exception:
+        return None if not authors else authors
+    return authors or None
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1695,14 +1839,18 @@ def check_respawn_guard(
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
-    handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
+    (a worker-authored comment carrying a URL for a PR **the card itself names**
+    in its title or ``idempotency_key``; re-spawning risks a duplicate PR —
+    unless a handoff event followed the comment: the named profile must work on
+    that PR). A PR URL the card does not name, or one named only by a
+    coordinator/automation note, is not worker evidence — see step 4.
+    The review lane skips the last two: they are the *inputs* to a review
     handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
     passes own those.
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT id, title, idempotency_key, assignee, last_failure_error "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -1778,20 +1926,54 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    Three conditions, all necessary, so the guard cannot hold a card on
+    #    evidence that has nothing to do with it:
+    #
+    #      a. the PR in the comment must be one the CARD names (title /
+    #         idempotency_key). A PR number belonging to some other card's work
+    #         is not this card's duplicate -- measured live: t_321d52c8 (about
+    #         #3933) was held for 21 consecutive ticks by comments about #3949
+    #         and #3952, which belong to different cards.
+    #      b. the comment must come from a profile that works this card (its
+    #         assignee, or a profile that has run it). A coordinator sweep note
+    #         is not "a prior worker already opened a PR".
+    #
+    #    A card that names NO PR is deliberately NOT scoped away: its own worker
+    #    may have opened a PR the card text never mentions, and re-spawning it
+    #    would duplicate that work. There is nothing to compare against, so the
+    #    guard stays as fail-closed as it was — (a) and (b) still apply to the
+    #    author, and an unrelated automation note still cannot re-arm it.
+    #
+    #    PR state (merged/closed) is likewise NOT consulted: this runs on
+    #    every tick of every board, and a GitHub round trip per candidate is
+    #    not affordable in the dispatch hot path. A matched, worker-authored PR
+    #    on the card's OWN PR keeps the pre-existing fail-closed behaviour --
+    #    if that PR is in fact merged, the card is finished work and its own
+    #    completion/review lane retires it, not the respawn guard.
+    #
     #    Exception: a handoff AFTER the newest PR comment (operator reassign,
     #    reviewer changes_requested, review reopen) names the profile that must
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
+    own_prs = _card_own_pr_numbers(row)
+    worker_authors = _card_worker_authors(conn, row)
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body, created_at FROM task_comments "
+        "SELECT author, body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         body = _kb._lossy_text(c["body"])
-        if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
+        match = _RESPAWN_GUARD_PR_URL_RE.search(body or "")
+        if not match:
             continue
+        if own_prs and match.group("num") not in own_prs:
+            continue  # the card names other PRs; this one is not one of them
+        if worker_authors is not None:
+            author = _kb._lossy_text(c["author"] or "")
+            if author not in worker_authors:
+                continue  # automation/coordinator note, not worker evidence
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).
             "SELECT kind, payload FROM task_events "
