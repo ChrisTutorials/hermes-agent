@@ -8,7 +8,6 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import re
 import signal
@@ -108,26 +107,13 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# PR state is read through this seam so the dispatch hot path stays testable and
-# swappable. ``None`` means "use the gh fetcher"; a fetcher that raises or
-# returns an unusable answer is treated as UNKNOWN, which keeps the guard.
-_PR_STATE_FN: Optional[Callable[[str, int], Optional[str]]] = None
-
-# A merged/closed answer is stable for the life of a PR, so it is cached
-# process-wide. OPEN is NOT cached: it can change while the card waits, and a
-# stale OPEN would park the card forever. Failures are cached too, briefly, so a
-# GitHub outage cannot turn every tick into a fresh timeout.
-_PR_STATE_TTL_TERMINAL = 3600     # 1h  — MERGED/CLOSED never un-merge
-_PR_STATE_TTL_UNKNOWN = 120       # 2m  — backoff after an unknown answer
-# OPEN is re-read, not cached forever: a PR can merge while the card waits, and a
-# stale OPEN would park the card for the rest of the 24h window. 5 min bounds a
-# parked card to <=12 gh calls/hour, and a PR that merges is released within 5
-# min of it happening.
-_PR_STATE_TTL_OPEN = 300           # 5m
-_PR_STATE_CACHE: dict[tuple[str, int], tuple[float, Optional[str]]] = {}
-_PR_STATE_FETCH_TIMEOUT = 10      # seconds; a hung gh must not stall a tick
-_PR_STATE_TERMINAL = ("MERGED", "CLOSED")
-_PR_STATE_KNOWN = ("OPEN", "MERGED", "CLOSED")
+# NOTE: PR state (merged/closed) is deliberately NOT consulted by the respawn
+# guard on this branch — see the step-4 comment in ``check_respawn_guard``. There
+# is no PR-state cache, seam or TTL policy here, and a comment claiming one would
+# be a lie: a matched PR on the card's own PR stays fail-closed for the full
+# ``_RESPAWN_GUARD_PR_WINDOW``. If that behaviour is ever revisited, implement
+# the fetcher, the cache and the tests together — do not reintroduce the
+# constants alone.
 
 # A card names its own PR in its title ("thistletide PR #3933 head ...") or in
 # its idempotency key (``github:<owner>/<repo>:pr:<n>[:suffix]`` natively,
