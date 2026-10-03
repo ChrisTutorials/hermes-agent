@@ -374,6 +374,115 @@ def test_zero_byte_board_placeholder_is_never_probed(
         assert all(p.stat().st_size > 0 for p in paths)
 
 
+def _mirror_card(
+    source_conn, target_conn, task_id: str, *, status: str, current_run_id=None,
+) -> None:
+    """Write a copy of ``task_id``'s row onto ``target_conn`` with a given status.
+
+    The duplication is a known, separate defect (``board=`` is silently ignored on
+    the coordinator profile, so a card created for one board lands on another).
+    It is reproduced here deliberately: the reaper must TOLERATE a
+    terminally-stale row on the wrong board, not try to clean it up.
+    """
+    row = source_conn.execute(
+        "SELECT * FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    assert row is not None, "precondition: the card must exist on the source board"
+    cols = [d[0] for d in source_conn.execute(
+        "SELECT * FROM tasks WHERE id = ?", (task_id,),
+    ).description]
+    placeholders = ", ".join("?" for _ in cols)
+    target_conn.execute(
+        "INSERT OR REPLACE INTO tasks (%s) VALUES (%s)" % (", ".join(cols), placeholders),
+        [status if c == "status" else (current_run_id if c == "current_run_id" else row[i])
+         for i, c in enumerate(cols)],
+    )
+
+
+def test_terminal_row_here_and_live_row_elsewhere_is_never_reaped(
+    kanban_home: Path, other_board: str, units,
+) -> None:
+    """THE BRANCH THE LANDED SUITE MISSED: ``else`` never consults another board.
+
+    The three multi-board tests above all leave the card ABSENT on the caller's
+    board, so they only ever exercise the ``row is None`` branch -- where the
+    cross-board guard sits. A card that DOES have a row here, in any status,
+    takes the ``else`` branch, which never asks another board anything.
+
+    Measured consequence (coordinator sweep 71): a card ``archived`` on
+    ``default`` and ``blocked`` on ``grid-placement`` had its LIVE grid-placement
+    worker stopped by ``default``'s tick six times in two hours, each logged
+    ``(card archived)`` -- the ``else`` branch, not "card missing". The scope name
+    carries the card id and no board slug, so ``default`` judged a scope that
+    belonged to ``grid-placement``.
+    """
+    # The card is owned by grid-placement and genuinely RUNNING there.
+    with kbc.connect_closing(board=other_board) as owner:
+        tid, run_id = _claim(owner, title="grid placement work")
+        unit = f"hermes-worker-kanban-{tid}-run-{run_id}.scope"
+        units["set"](unit)
+        other_status = kb.get_task(owner, tid).status
+        assert other_status == "running"
+
+        # default holds a terminally-stale duplicate of the same id.
+        with kbc.connect_closing(board="default") as stale:
+            _mirror_card(owner, stale, tid, status="archived",
+                         current_run_id=run_id)
+
+            stopped: list[str] = []
+            assert kbd.reap_orphan_worker_scopes(stale, stop_fn=stopped.append) == []
+            assert stopped == [], (
+                "default's terminal row must not stop grid-placement's live worker"
+            )
+
+    # Control: the guard is `live`, not `present`. Once the card is terminal on
+    # EVERY board it is a genuine orphan and must be reaped -- otherwise this
+    # fix would have turned the reaper into a no-op and leaked every scope.
+    with kbc.connect_closing(board=other_board) as owner:
+        kb.archive_task(owner, tid)
+    with kbc.connect_closing(board="default") as alone:
+        stopped = []
+        assert kbd.reap_orphan_worker_scopes(alone, stop_fn=stopped.append) == [unit]
+        assert stopped == [unit], (
+            "a card terminal on every board is a real leak and must still be reaped"
+        )
+
+
+@pytest.mark.parametrize(
+    "status_here, expect_reaped",
+    [
+        ("archived", False),   # terminal here, live elsewhere  -> spare
+        ("done",     False),   # the other terminal status    -> spare
+        ("blocked",  False),   # non-terminal here, run id is the other board's
+        ("running",  False),
+    ],
+)
+def test_any_local_row_spares_a_scope_that_is_live_on_another_board(
+    kanban_home: Path, other_board: str, units,
+    status_here: str, expect_reaped: bool,
+) -> None:
+    """The guard is on the DECISION to stop, not on the reason string.
+
+    Parametrised over the local status so the guard cannot be satisfied by a
+    single special-cased value: whatever this board's row says, a card that is
+    alive on another board is not this board's orphan to reap.
+    """
+    with kbc.connect_closing(board=other_board) as owner:
+        tid, run_id = _claim(owner, title="grid work")
+        unit = f"hermes-worker-kanban-{tid}-run-{run_id}.scope"
+        units["set"](unit)
+        with kbc.connect_closing(board="default") as other:
+            _mirror_card(owner, other, tid, status=status_here,
+                         current_run_id=run_id)
+            stopped: list[str] = []
+            got = kbd.reap_orphan_worker_scopes(other, stop_fn=stopped.append)
+            if expect_reaped:
+                assert got == [unit]
+            else:
+                assert got == [], f"status={status_here} must spare a live-elsewhere card"
+                assert stopped == []
+
+
 def test_probe_never_opens_a_second_connection_to_the_callers_board(
     kanban_home: Path, other_board: str, units,
 ) -> None:

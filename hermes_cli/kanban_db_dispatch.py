@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -56,6 +57,20 @@ TERMINAL_WORKER_REAP_GRACE_SECONDS = 120
 # its scope is expected to unwind on its own.
 _TERMINAL_SCOPED_STATUSES = frozenset({"done", "archived"})
 
+
+@dataclass(frozen=True)
+class _OtherBoardCard:
+    """What the boards OTHER than the caller's hold for one card id.
+
+    ``present``: some other board has a row for the id (terminal or not).
+    ``live``: some other board has it in a NON-terminal state, i.e. a worker
+    there is still going. ``live`` is the only one that must spare a scope; a
+    card that is terminal everywhere is a genuine orphan.
+    """
+
+    present: bool
+    live: bool
+
 # ---------------------------------------------------------------------------
 # Respawn guard constants
 # ---------------------------------------------------------------------------
@@ -89,9 +104,30 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/(?P<num>\d+)",
+    r"https?://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/(?P<num>\d+)",
     re.IGNORECASE,
 )
+
+# PR state is read through this seam so the dispatch hot path stays testable and
+# swappable. ``None`` means "use the gh fetcher"; a fetcher that raises or
+# returns an unusable answer is treated as UNKNOWN, which keeps the guard.
+_PR_STATE_FN: Optional[Callable[[str, int], Optional[str]]] = None
+
+# A merged/closed answer is stable for the life of a PR, so it is cached
+# process-wide. OPEN is NOT cached: it can change while the card waits, and a
+# stale OPEN would park the card forever. Failures are cached too, briefly, so a
+# GitHub outage cannot turn every tick into a fresh timeout.
+_PR_STATE_TTL_TERMINAL = 3600     # 1h  — MERGED/CLOSED never un-merge
+_PR_STATE_TTL_UNKNOWN = 120       # 2m  — backoff after an unknown answer
+# OPEN is re-read, not cached forever: a PR can merge while the card waits, and a
+# stale OPEN would park the card for the rest of the 24h window. 5 min bounds a
+# parked card to <=12 gh calls/hour, and a PR that merges is released within 5
+# min of it happening.
+_PR_STATE_TTL_OPEN = 300           # 5m
+_PR_STATE_CACHE: dict[tuple[str, int], tuple[float, Optional[str]]] = {}
+_PR_STATE_FETCH_TIMEOUT = 10      # seconds; a hung gh must not stall a tick
+_PR_STATE_TERMINAL = ("MERGED", "CLOSED")
+_PR_STATE_KNOWN = ("OPEN", "MERGED", "CLOSED")
 
 # A card names its own PR in its title ("thistletide PR #3933 head ...") or in
 # its idempotency key (``github:<owner>/<repo>:pr:<n>[:suffix]`` natively,
@@ -626,15 +662,61 @@ def _other_board_readonly_candidates(
     return candidates
 
 
-def _card_seen_on_another_board(conn: sqlite3.Connection, task_id: str) -> bool:
+def _other_board_card_liveness(conn: sqlite3.Connection, task_id: str) -> "_OtherBoardCard":
+    """How the OTHER boards see ``task_id``: ``present`` and ``live``.
+
+    ``present`` is True when ANY other board holds a row for the id. ``live`` is
+    True when ANY other board holds it in a NON-TERMINAL state -- the evidence
+    that a worker on that board is still going.
+
+    Both are computed over EVERY candidate, never over the first board that
+    happens to hold the card: a card can be duplicated on three boards, and
+    "archived on marketing" must not mask "running on grid-placement". An
+    unreadable board sets both True: the fail-closed answer is "assume it is
+    alive", because the cost of that mistake is a leaked scope and the cost of
+    the opposite is a live worker killed.
+
+    Read-only (``mode=ro``) so a probe cannot take another board's write lock or
+    mutate it -- the deadlock that stopped :func:`_scope_run_is_live` from ever
+    getting a second connection applies to the SAME board, which this never
+    touches.
+    """
+    found_present = False
+    found_live = False
+    for path in _other_board_readonly_candidates(conn):
+        other = None
+        try:
+            other = sqlite3.connect(
+                path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0,
+            )
+            other.row_factory = sqlite3.Row
+            row = other.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if row is not None:
+                found_present = True
+                if _kb._lossy_text(row["status"] or "") not in _TERMINAL_SCOPED_STATUSES:
+                    found_live = True
+        except Exception:
+            _kb._log.debug(
+                "kanban dispatch: cross-board card probe failed for %s; "
+                "treating the card as present and live (fail closed)",
+                path, exc_info=True,
+            )
+            return _OtherBoardCard(present=True, live=True)
+        finally:
+            if other is not None:
+                with contextlib.suppress(Exception):
+                    other.close()
+    return _OtherBoardCard(present=found_present, live=found_live)
+
+
+def _any_other_board_holds(conn: sqlite3.Connection, task_id: str) -> bool:
     """Whether ANY other board holds a row for ``task_id``.
 
     ``True`` also covers "could not tell": an unreadable other board is
     treated as possibly holding the card, because the fail-closed answer here
-    is "do not reap". Read-only (``mode=ro``) so a probe cannot take another
-    board's write lock or mutate it — the deadlock that stopped
-    :func:`_scope_run_is_live` from ever getting a second connection applies to
-    the SAME board, which this never touches.
+    is "do not reap".
     """
     for path in _other_board_readonly_candidates(conn):
         other = None
@@ -662,6 +744,31 @@ def _card_seen_on_another_board(conn: sqlite3.Connection, task_id: str) -> bool:
     return False
 
 
+def _card_seen_on_another_board(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether ANY other board holds a row for ``task_id``.
+
+    ``True`` also covers "could not tell": an unreadable other board is
+    treated as possibly holding the card, because the fail-closed answer here
+    is "do not reap". Read-only (``mode=ro``) so a probe cannot take another
+    board's write lock or mutate it — the deadlock that stopped
+    :func:`_scope_run_is_live` from ever getting a second connection applies to
+    the SAME board, which this never touches.
+    """
+    return _any_other_board_holds(conn, task_id)
+
+
+def _other_board_card_is_live(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether the card is still ALIVE on some board other than the caller's.
+
+    This is the guard that must sit in front of the DECISION to stop a scope, and
+    it is deliberately status-aware: ``live`` is what distinguishes a genuine
+    orphan from a card whose real owner is another board. A card that is
+    terminal on BOTH boards is still reaped — see
+    :func:`reap_orphan_worker_scopes`.
+    """
+    return _other_board_card_liveness(conn, task_id).live
+
+
 def reap_orphan_worker_scopes(conn: sqlite3.Connection, *, stop_fn=None) -> list[str]:
     """Stop ``hermes-worker-kanban-*`` scopes whose card is no longer running.
 
@@ -677,11 +784,20 @@ def reap_orphan_worker_scopes(conn: sqlite3.Connection, *, stop_fn=None) -> list
     still busy. Nothing else in the dispatcher looks at systemd scopes, so
     these leak until an operator stops them by hand.
 
-    A scope is reaped only when its card is positively known to be finished:
-    the card is missing on this board AND on every other board, or its status
-    is terminal (``done``/``archived``), or it points at a different run. A
-    card still ``running`` on that same run is left strictly alone -- a long
-    wall time is not evidence of a leak.
+    A scope is reaped only when its card is positively known to be finished
+    EVERYWHERE: missing on this board AND on every other board, terminal here
+    AND terminal on every other board, or pointing at a different run. A card
+    still ``running`` on that same run is left strictly alone -- a long wall
+    time is not evidence of a leak.
+
+    The cross-board condition is a single guard in front of the decision to
+    stop, because a scope name carries the card id and no board slug: every
+    board's tick enumerates every board's scopes, so this board must never judge
+    a card that is still alive somewhere else. ``t_141e6bd0``: with the guard
+    inside the ``row is None`` branch, a card terminal on THIS board and
+    non-terminal on its real owner board was reaped by the wrong board, six
+    live kills in two hours. The guard asks for ``live`` rather than
+    ``present`` so a card terminal on all boards is still reaped.
 
     Returns the scope unit names stopped. Best-effort: any systemctl failure
     is logged and skips only that scope.
@@ -762,6 +878,28 @@ def reap_orphan_worker_scopes(conn: sqlite3.Connection, *, stop_fn=None) -> list
                 f"card {status}" if status in _TERMINAL_SCOPED_STATUSES
                 else "superseded run"
             )
+
+        # THE GUARD THAT BELONGS HERE, in front of the decision and not inside
+        # the `row is None` branch (t_141e6bd0).
+        #
+        # A scope name is `hermes-worker-kanban-<card id>-run-<n>.scope`: it
+        # carries the card id and NO board slug, so every board's tick enumerates
+        # every board's scopes. The `else` branch above never consulted another
+        # board, so a card terminal HERE (archived, from the `board=` placement
+        # defect) and non-terminal on its REAL owner board was reaped by the
+        # wrong board -- six live kills in two hours, each logged
+        # "(card archived)", i.e. this branch and not "card missing".
+        #
+        # `live` (not `present`) is the question: a card that is terminal on all
+        # boards is a genuine orphan and must still be reaped, or the reaper
+        # becomes a no-op. An unreadable other board answers `live=True`
+        # (fail closed), same as every other probe here.
+        if row is not None and _other_board_card_is_live(conn, task_id):
+            _kb._log.debug(
+                "kanban dispatch: scope %s belongs to a card still live on "
+                "another board; not this board's orphan to reap", unit,
+            )
+            continue
         try:
             (stop_fn or _stop_scope)(unit)
         except Exception:
